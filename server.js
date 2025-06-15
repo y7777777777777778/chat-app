@@ -1,9 +1,13 @@
-
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
 const fileUpload = require("express-fileupload");
 const { Server } = require("socket.io");
+const sqlite3 = require("sqlite3").verbose();
+const bcrypt = require("bcrypt");
+const session = require("express-session");
+const Knex = require("knex");
+const KnexSessionStore = require("connect-session-knex")(session);
 
 const app = express();
 const server = require("http").createServer(app);
@@ -17,110 +21,415 @@ const MESSAGE_FILE = "messages.json";
 const PINNED_FILE = "pinnedMessages.json";
 const UPLOAD_DIR = "public/uploads";
 
-// **アップロードフォルダが存在しない場合、作成**
 if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-// **メッセージを保存**
+// SQLiteデータベースの初期化とテーブル作成
+const dbPath = "./chat.db";
+const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
+    if (err) {
+        console.error("Database connection error:", err.message);
+        process.exit(1);
+    } else {
+        console.log("Connected to the SQLite database.");
+        db.run(`CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )`, (err) => {
+            if (err) {
+                console.error("Error creating users table:", err.message);
+                process.exit(1);
+            } else {
+                console.log("Users table ensured.");
+            }
+        });
+    }
+});
+
+// Knexの設定 (セッションストア用)
+const knex = Knex({
+    client: "sqlite3",
+    connection: {
+        filename: dbPath,
+    },
+    useNullAsDefault: true,
+});
+
+// セッションストアの設定
+const sessionStore = new KnexSessionStore({
+    tablename: "sessions",
+    sidfieldname: "sid",
+    knex: knex,
+    createtable: true,
+    clearInterval: 1000 * 60 * 60
+});
+
+// セッションミドルウェアの設定
+const sessionMiddleware = session({
+    secret: process.env.SESSION_SECRET || "your_super_secret_key_here_please_change_me_and_make_it_long_and_random",
+    resave: false,
+    saveUninitialized: false,
+    store: sessionStore,
+    cookie: {
+        maxAge: 1000 * 60 * 60 * 24, // 24時間
+        httpOnly: true,
+        secure: true, // HTTPS経由でのみクッキーを送信
+        sameSite: 'None' // クロスサイトリクエストでクッキーを送信
+    },
+    proxy: true // Renderのようなプロキシサーバーの背後で動作する場合に必要
+});
+app.use(sessionMiddleware);
+
+// 認証チェックミドルウェア
+function isAuthenticated(req, res, next) {
+    const alwaysPublicPaths = [
+        '/login',
+        '/register',
+        '/guest-login', // ゲストログインも認証不要
+        '/change-username' // ユーザー名変更も認証済みのセッションでアクセス可能
+    ];
+
+    const publicGetPaths = [
+        '/',
+        '/index.html',
+        '/register.html',
+        '/chat.html',
+        '/check-auth'
+    ];
+
+    if (alwaysPublicPaths.includes(req.path) && req.method === 'POST') {
+        return next();
+    }
+
+    if (publicGetPaths.includes(req.path) && req.method === 'GET') {
+        return next();
+    }
+
+    if (req.path.startsWith('/uploads/')) {
+        return next();
+    }
+
+    if (req.session.isAuthenticated && req.session.username) {
+        next();
+    } else {
+        console.log(`Access denied for ${req.method} ${req.path}. Redirecting to /index.html`);
+        if (req.xhr || (req.headers.accept && req.headers.accept.includes('application/json'))) {
+            res.status(401).json({ success: false, message: "認証が必要です。" });
+        } else {
+            res.redirect('/index.html?redirected=true');
+        }
+    }
+}
+app.use(isAuthenticated);
+
+// メッセージを保存
 function saveMessage(data) {
     let messages = fs.existsSync(MESSAGE_FILE) ? JSON.parse(fs.readFileSync(MESSAGE_FILE, "utf-8")) : [];
     messages.push(data);
     fs.writeFileSync(MESSAGE_FILE, JSON.stringify(messages, null, 2));
 }
 
-// **ピン止めメッセージを保存**
+// ピン止めメッセージを保存
 function savePinnedMessage(room, message) {
     let pinned = fs.existsSync(PINNED_FILE) ? JSON.parse(fs.readFileSync(PINNED_FILE, "utf-8")) : {};
     pinned[room] = message;
     fs.writeFileSync(PINNED_FILE, JSON.stringify(pinned, null, 2));
 }
 
-// **ルートアクセス時に `chat.html` を提供**
+// ルートアクセス時に `index.html` を提供
 app.get("/", (req, res) => {
-    res.sendFile(path.join(__dirname, "public", "chat.html"));
+    res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-// **メッセージ送信API**
-app.post("/send-message", (req, res) => {
-    const { message, username, room } = req.body;
-    if (!message) return res.status(400).json({ error: "Message cannot be empty!" });
+// ユーザー登録エンドポイント
+app.post("/register", async (req, res) => {
+    const { username, password } = req.body;
 
-    const newMessage = { user: username, text: message, room, timestamp: new Date().toISOString(), pinned: false };
-    saveMessage(newMessage);
-    io.to(room).emit("message", newMessage);
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: "ユーザー名とパスワードは必須です。" });
+    }
 
-    res.status(200).json({ success: true });
-});
-
-// **ピン止めAPI**
-app.post("/pin-message", (req, res) => {
-    const { message, room } = req.body;
-    if (!message) return res.status(400).json({ error: "Pinned message cannot be empty!" });
-
-    savePinnedMessage(room, message);
-    io.to(room).emit("updatePinnedMessage", { message });
-
-    res.status(200).json({ success: true });
-});
-
-// **メッセージ取得API**
-app.get("/messages", (req, res) => {
-    const { room } = req.query;
-    if (!fs.existsSync(MESSAGE_FILE)) return res.json([]);
-    const messages = JSON.parse(fs.readFileSync(MESSAGE_FILE, "utf-8"));
-    res.json(messages.filter(m => m.room === room));
-});
-
-// **ピン止めメッセージ取得API**
-app.get("/pinned-messages", (req, res) => {
-    if (!fs.existsSync(PINNED_FILE)) return res.json({});
-    res.json(JSON.parse(fs.readFileSync(PINNED_FILE, "utf-8")));
-});
-
-// **ファイルアップロードAPI**
-app.post("/upload", (req, res) => {
     try {
-        if (!req.files || !req.files.file) {
-            return res.status(400).json({ error: "No file uploaded!" });
-        }
+        const hashedPassword = await bcrypt.hash(password, 10);
 
-        const file = req.files.file;
-        const filePath = `${UPLOAD_DIR}/${file.name}`;
-
-        file.mv(filePath, (err) => {
+        db.run("INSERT INTO users (username, password) VALUES (?, ?)", [username, hashedPassword], function(err) {
             if (err) {
-                console.error("File upload error:", err);
-                return res.status(500).json({ error: err.message });
+                if (err.message.includes("UNIQUE constraint failed: users.username")) {
+                    return res.status(409).json({ success: false, message: "このユーザー名は既に存在します。" });
+                }
+                console.error("Registration DB error:", err.message);
+                return res.status(500).json({ success: false, message: "登録中にエラーが発生しました。" });
             }
-
-            const fileUrl = `/uploads/${file.name}`;
-            const fileMessage = { user: req.body.username, file: fileUrl, room: req.body.room, timestamp: new Date().toISOString(), pinned: false };
-            saveMessage(fileMessage);
-            io.to(req.body.room).emit("message", fileMessage);
-
-            res.json({ success: true, fileUrl });
+            res.json({ success: true, message: "登録が完了しました。" });
         });
     } catch (error) {
-        console.error("Unexpected error in upload:", error);
-        res.status(500).json({ error: "Internal Server Error" });
+        console.error("Hashing or Registration general error:", error);
+        res.status(500).json({ success: false, message: "サーバーエラーが発生しました。" });
     }
 });
 
-// **Socket.IOの処理**
+// ユーザーログインエンドポイント
+app.post("/login", (req, res) => {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: "ユーザー名とパスワードは必須です。" });
+    }
+
+    db.get("SELECT * FROM users WHERE username = ?", [username], async (err, user) => {
+        if (err) {
+            console.error("Login DB query error:", err.message);
+            return res.status(500).json({ success: false, message: "サーバーエラーが発生しました。" });
+        }
+        if (!user) {
+            return res.status(401).json({ success: false, message: "ユーザー名またはパスワードが違います。" });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (isMatch) {
+            req.session.userId = user.id;
+            req.session.username = user.username;
+            req.session.isAuthenticated = true;
+
+            req.session.save((err) => {
+                if (err) {
+                    console.error("Session save error after login:", err);
+                    return res.status(500).json({ success: false, message: "ログイン中にセッション保存エラーが発生しました。" });
+                }
+                res.json({ success: true, message: "ログイン成功！", username: user.username });
+            });
+        } else {
+            res.status(401).json({ success: false, message: "ユーザー名またはパスワードが違います。" });
+        }
+    });
+});
+
+// ゲストログインエンドポイント
+app.post("/guest-login", (req, res) => {
+    // ユニークなゲスト名を生成 (例: ゲスト_ランダムな4桁の数字)
+    const guestUsername = "ゲスト_" + Math.floor(1000 + Math.random() * 9000);
+
+    req.session.userId = null; // ゲストなのでDBのIDはなし
+    req.session.username = guestUsername;
+    req.session.isAuthenticated = true;
+
+    req.session.save((err) => {
+        if (err) {
+            console.error("Session save error after guest login:", err);
+            return res.status(500).json({ success: false, message: "ゲストログイン中にセッション保存エラーが発生しました。" });
+        }
+        res.json({ success: true, message: "ゲストとして参加しました！", username: guestUsername });
+    });
+});
+
+// ユーザー名変更エンドポイント
+app.post("/change-username", (req, res) => {
+    const { newUsername } = req.body;
+    const userId = req.session.userId;
+    const oldUsername = req.session.username;
+
+    if (!userId) {
+        // ゲストユーザーはIDがないので、変更不可とする
+        // あるいは、ゲストユーザー用の特殊な変更ロジックをここに記述することも可能
+        return res.status(401).json({ success: false, message: "このアカウントタイプではユーザー名を変更できません。" });
+    }
+    if (!newUsername || newUsername.trim() === "") {
+        return res.status(400).json({ success: false, message: "新しいユーザー名を入力してください。" });
+    }
+    if (newUsername === oldUsername) {
+        return res.status(400).json({ success: false, message: "現在のユーザー名と同じです。" });
+    }
+
+    db.run("UPDATE users SET username = ? WHERE id = ?", [newUsername, userId], function(err) {
+        if (err) {
+            if (err.message.includes("UNIQUE constraint failed: users.username")) {
+                return res.status(409).json({ success: false, message: "このユーザー名は既に存在します。" });
+            }
+            console.error("Change username DB error:", err.message);
+            return res.status(500).json({ success: false, message: "ユーザー名の変更中にエラーが発生しました。" });
+        }
+        if (this.changes === 0) {
+            return res.status(404).json({ success: false, message: "ユーザーが見つかりませんでした。" });
+        }
+
+        // セッションのユーザー名を更新
+        req.session.username = newUsername;
+        req.session.save((err) => {
+            if (err) {
+                console.error("Session update error after username change:", err);
+                return res.status(500).json({ success: false, message: "ユーザー名変更後にセッション保存エラーが発生しました。" });
+            }
+            res.json({ success: true, message: "ユーザー名を変更しました！", newUsername: newUsername });
+        });
+    });
+});
+
+
+// ログアウトエンドポイント
+app.post("/logout", (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            console.error("Logout session destroy error:", err);
+            return res.status(500).json({ success: false, message: "ログアウト中にエラーが発生しました。" });
+        }
+        res.json({ success: true, message: "ログアウトしました。" });
+    });
+});
+
+// 現在の認証状態とユーザー名を取得するエンドポイント
+app.get("/check-auth", (req, res) => {
+    // キャッシュを強制的に無効化するヘッダーを追加
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    if (req.session.isAuthenticated && req.session.username) {
+        res.json({ authenticated: true, username: req.session.username });
+    } else {
+        res.json({ authenticated: false });
+    }
+});
+
+// メッセージ送信のAPIエンドポイント
+app.post("/send-message", (req, res) => {
+    const { message, room } = req.body;
+    const username = req.session.username; // セッションからユーザー名を取得
+
+    if (!username) {
+        return res.status(401).json({ error: "認証されていません。" });
+    }
+    if (!message.trim()) {
+        return res.status(400).json({ error: "メッセージは空にできません。" });
+    }
+
+    const chatMessage = { user: username, text: message, room, timestamp: new Date().toISOString() };
+    saveMessage(chatMessage);
+    io.to(room).emit("message", chatMessage);
+    res.json({ success: true });
+});
+
+// メッセージ履歴の取得APIエンドポイント
+app.get("/messages", (req, res) => {
+    const room = req.query.room;
+    if (!room) {
+        return res.status(400).json({ error: "roomパラメータが必要です。" });
+    }
+    if (!req.session.username) { // ここでも認証チェック
+        return res.status(401).json({ error: "認証されていません。" });
+    }
+
+    const messages = fs.existsSync(MESSAGE_FILE) ? JSON.parse(fs.readFileSync(MESSAGE_FILE, "utf-8")) : [];
+    res.json(messages.filter(m => m.room === room));
+});
+
+// ファイルアップロードのAPIエンドポイント
+app.post("/upload", (req, res) => {
+    const username = req.session.username; // セッションからユーザー名を取得
+    const room = req.body.room;
+
+    if (!username) {
+        return res.status(401).json({ error: "認証されていません。" });
+    }
+
+    if (!req.files || Object.keys(req.files).length === 0) {
+        return res.status(400).json({ error: "No files were uploaded!" });
+    }
+
+    const file = req.files.file;
+    const filePath = `${UPLOAD_DIR}/${file.name}`;
+
+    file.mv(filePath, (err) => {
+        if (err) {
+            console.error("File upload error:", err);
+            return res.status(500).json({ error: err.message });
+        }
+
+        const fileUrl = `/uploads/${file.name}`;
+        const fileMessage = { user: username, file: fileUrl, room: room, timestamp: new Date().toISOString(), pinned: false };
+        saveMessage(fileMessage);
+        io.to(room).emit("message", fileMessage);
+
+        res.json({ success: true, fileUrl });
+    });
+});
+
+// Socket.IOの認証ミドルウェア
+io.use((socket, next) => {
+    sessionMiddleware(socket.request, {}, next);
+});
+
+// Socket.IOの処理
 io.on("connection", (socket) => {
-    socket.on("joinRoom", (room) => {
+    console.log("A user connected via Socket.IO");
+
+    const session = socket.request.session;
+    if (session && session.isAuthenticated && session.username) {
+        socket.username = session.username;
+        console.log(`Socket connected for user: ${socket.username}`);
+    } else {
+        console.warn("Unauthenticated Socket.IO connection attempt. Disconnecting.");
+        socket.emit("redirect", "/index.html"); // クライアントにリダイレクトを指示
+        socket.disconnect(true);
+        return;
+    }
+
+    socket.on("joinRoom", (data) => {
+        const { room } = data;
+        
+        if (!socket.username) { // Socket.IO接続時も認証を再確認
+             console.warn("User tried to join room without authentication via Socket.");
+             socket.emit("redirect", "/index.html");
+             socket.disconnect(true);
+             return;
+        }
+
         socket.join(room);
+        socket.currentRoom = room;
+
+        console.log(`${socket.username} joined room: ${room}`);
+
         const messages = fs.existsSync(MESSAGE_FILE) ? JSON.parse(fs.readFileSync(MESSAGE_FILE, "utf-8")) : [];
         socket.emit("messageHistory", messages.filter(m => m.room === room));
 
         const pinned = fs.existsSync(PINNED_FILE) ? JSON.parse(fs.readFileSync(PINNED_FILE, "utf-8")) : {};
         if (pinned[room]) socket.emit("updatePinnedMessage", { message: pinned[room] });
     });
+
+    socket.on("leaveRoom", (room) => {
+        if (socket.currentRoom && socket.currentRoom === room) {
+            socket.leave(room);
+            console.log(`${socket.username || 'Unknown user'} left room: ${room}`);
+            socket.currentRoom = null;
+        }
+    });
+
+    socket.on("pinMessage", (data) => {
+        const { message, room } = data;
+        if (!socket.username) {
+            console.warn("Unauthenticated user tried to pin message via Socket.");
+            return;
+        }
+        savePinnedMessage(room, message);
+        io.to(room).emit("updatePinnedMessage", { message });
+    });
+
+    socket.on("unpinMessage", (room) => {
+        if (!socket.username) {
+            console.warn("Unauthenticated user tried to unpin message via Socket.");
+            return;
+        }
+        savePinnedMessage(room, null);
+        io.to(room).emit("updatePinnedMessage", { message: null });
+    });
+
+    socket.on("disconnect", () => {
+        console.log("A user disconnected.");
+    });
 });
 
-// **サーバー起動**
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
